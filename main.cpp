@@ -59,7 +59,7 @@ int main(void) {
                 ble.gap().clearAdvertisingPayload();
             }
             /* Setup advertising. */
-            ble.gap().accumulateAdvertisingPayload(GapAdvertisingData::BREDR_NOT_SUPPORTED | GapAdvertisingData::LE_LIMITED_DISCOVERABLE);
+            ble.gap().accumulateAdvertisingPayload(GapAdvertisingData::BREDR_NOT_SUPPORTED | GapAdvertisingData::LE_GENERAL_DISCOVERABLE);
             ble.gap().accumulateAdvertisingPayload(GapAdvertisingData::UNKNOWN);
             ble.gap().accumulateAdvertisingPayload(GapAdvertisingData::MANUFACTURER_SPECIFIC_DATA, (uint8_t *)ADV_INFO, sizeof(ADV_INFO));
             ble.gap().setAdvertisingType(GapAdvertisingParams::ADV_NON_CONNECTABLE_UNDIRECTED);
