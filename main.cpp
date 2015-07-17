@@ -21,26 +21,42 @@
 #include "ble/DiscoveredService.h"
 #include "TMP_nrf51/TMP_nrf51.h"
 
-
-
 BLE ble;
-
-DigitalOut alivenessLED(LED1, 1);
 TMP_nrf51 tempSensor;
+DigitalOut alivenessLED(LED1, 1);
+static bool triggerTempValueRead = true;
 
-bool triggerLedCharacteristic = false;
-
-uint8_t ADV_INFO[6] = {0xFE, 0xFE, 0x00, 0x00, 0x00, 0x00}; /* Special character || temperature value */
-uint8_t fNewTempValue;
-
-void periodicCallback(void) {
-    alivenessLED = !alivenessLED; /* Do blinky on LED1 while we're waiting for BLE events */
-    fNewTempValue = 1;
+void periodicCallback(void)
+{
+    /* Do blinky on LED1 while we're waiting for BLE events */
+    alivenessLED = !alivenessLED;
+    triggerTempValueRead = true;
 }
 
+void temperatureValueAdvertising(void)
+{
+    TMP_nrf51::tmpSensorValue_t tempVal;
+    /* Read a new temperature value */
+    tempVal = tempSensor.get();
+    printf("Temp is %f\r\n", tempVal);
+    
+    /* Stop advertising and clear the payload if in advertising state */
+    if((ble.gap().getState()).advertising == 1) {
+        ble.gap().stopAdvertising();
+        ble.gap().clearAdvertisingPayload();
+    }
+    /* Setup advertising. */
+    ble.gap().accumulateAdvertisingPayload(GapAdvertisingData::BREDR_NOT_SUPPORTED | GapAdvertisingData::LE_GENERAL_DISCOVERABLE);
+    ble.gap().accumulateAdvertisingPayload(GapAdvertisingData::GENERIC_THERMOMETER);
+    ble.gap().accumulateAdvertisingPayload(GapAdvertisingData::MANUFACTURER_SPECIFIC_DATA, (uint8_t *)&tempVal, sizeof(TMP_nrf51::tmpSensorValue_t));
+    ble.gap().setAdvertisingType(GapAdvertisingParams::ADV_NON_CONNECTABLE_UNDIRECTED);
+    ble.gap().setAdvertisingInterval(500);
 
+    ble.gap().startAdvertising();
+}
 
-int main(void) {
+int main(void)
+{
     Ticker ticker;
     /* Refresh temperature value every 2 seconds */
     ticker.attach(periodicCallback, 2);
@@ -48,26 +64,9 @@ int main(void) {
     ble.init();
 
     while (true) {
-        if (fNewTempValue) {
-            float tempVal;
-            tempVal = tempSensor.get();
-            memcpy(&ADV_INFO[2], &tempVal, 4); /* 4 bytes left for tempVal */
-            printf("temp is %f\r\n", tempVal);
-            
-            if((ble.gap().getState()).advertising == 1) {
-                ble.gap().stopAdvertising();
-                ble.gap().clearAdvertisingPayload();
-            }
-            /* Setup advertising. */
-            ble.gap().accumulateAdvertisingPayload(GapAdvertisingData::BREDR_NOT_SUPPORTED | GapAdvertisingData::LE_GENERAL_DISCOVERABLE);
-            ble.gap().accumulateAdvertisingPayload(GapAdvertisingData::UNKNOWN);
-            ble.gap().accumulateAdvertisingPayload(GapAdvertisingData::MANUFACTURER_SPECIFIC_DATA, (uint8_t *)ADV_INFO, sizeof(ADV_INFO));
-            ble.gap().setAdvertisingType(GapAdvertisingParams::ADV_NON_CONNECTABLE_UNDIRECTED);
-            ble.gap().setAdvertisingInterval(500);
-    
-            ble.gap().startAdvertising();
-            
-            fNewTempValue = 0;
+        if (triggerTempValueRead) {
+            temperatureValueAdvertising();
+            triggerTempValueRead = false;
         }
         ble.waitForEvent();
     }
