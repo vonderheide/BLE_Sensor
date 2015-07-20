@@ -21,6 +21,16 @@
 #include "ble/DiscoveredService.h"
 #include "TMP_nrf51/TMP_nrf51.h"
 
+#define COMP_ID_TEST 0xFEFE
+
+#pragma pack(1)
+typedef struct manufacturerData {
+    uint16_t companyId;
+    /* User defined manufacture data */
+    TMP_nrf51::tmpSensorValue_t tmpSensorValue;
+} manufacturerData_t;
+#pragma pack()
+
 BLE ble;
 TMP_nrf51 tempSensor;
 DigitalOut alivenessLED(LED1, 1);
@@ -35,23 +45,27 @@ void periodicCallback(void)
 
 void temperatureValueAdvertising(void)
 {
-    TMP_nrf51::tmpSensorValue_t tempVal;
+    manufacturerData_t manuData;
+    manuData.companyId = COMP_ID_TEST;
+    
     /* Read a new temperature value */
-    tempVal = tempSensor.get();
-    printf("Temp is %f\r\n", tempVal);
+    manuData.tmpSensorValue = tempSensor.get();
+    printf("Temp is %f\r\n", (float)manuData.tmpSensorValue);
     
     /* Stop advertising and clear the payload if in advertising state */
     if((ble.gap().getState()).advertising == 1) {
         ble.gap().stopAdvertising();
         ble.gap().clearAdvertisingPayload();
     }
-    /* Setup advertising. */
-    ble.gap().accumulateAdvertisingPayload(GapAdvertisingData::BREDR_NOT_SUPPORTED | GapAdvertisingData::LE_GENERAL_DISCOVERABLE);
-    ble.gap().accumulateAdvertisingPayload(GapAdvertisingData::GENERIC_THERMOMETER);
-    ble.gap().accumulateAdvertisingPayload(GapAdvertisingData::MANUFACTURER_SPECIFIC_DATA, (uint8_t *)&tempVal, sizeof(TMP_nrf51::tmpSensorValue_t));
+    
+    /* Setup advertising payload */
+    ble.gap().accumulateAdvertisingPayload(GapAdvertisingData::BREDR_NOT_SUPPORTED | GapAdvertisingData::LE_GENERAL_DISCOVERABLE); /* Set flag */
+    ble.gap().accumulateAdvertisingPayload(GapAdvertisingData::GENERIC_THERMOMETER); /* Set appearance */
+    ble.gap().accumulateAdvertisingPayload(GapAdvertisingData::MANUFACTURER_SPECIFIC_DATA, (uint8_t *)&manuData, sizeof(manufacturerData_t)); /* Set data */
+    /* Setup advertising parameters */
     ble.gap().setAdvertisingType(GapAdvertisingParams::ADV_NON_CONNECTABLE_UNDIRECTED);
     ble.gap().setAdvertisingInterval(500);
-
+    /* Start advertising */
     ble.gap().startAdvertising();
 }
 
