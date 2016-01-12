@@ -19,9 +19,7 @@
 #include "ble/BLE.h"
 #include "TMP_nrf51/TMP_nrf51.h"
 
-BLE ble;
-
-static Ticker ticker;
+static Ticker     ticker;
 static TMP_nrf51  tempSensor;
 static bool       triggerTempValueUpdate = false;
 static DigitalOut alivenessLED(LED1, 1);
@@ -43,12 +41,38 @@ void periodicCallback(void)
 void setupApplicationData(ApplicationData_t &appData)
 {
     static const uint16_t APP_SPECIFIC_ID_TEST = 0xFEFE;
+
     appData.applicationSpecificId = APP_SPECIFIC_ID_TEST;
     appData.tmpSensorValue        = tempSensor.get();
 }
 
-void startAdvertisingTemperature(void)
+/**
+ * This function is called when the ble initialization process has failled
+ */
+void onBleInitError(BLE &ble, ble_error_t error)
 {
+    /* Initialization error handling should go here */
+}
+
+/**
+ * Callback triggered when the ble initialization process has finished
+ */
+void bleInitComplete(BLE::InitializationCompleteCallbackContext *params)
+{
+    BLE&        ble   = params->ble;
+    ble_error_t error = params->error;
+
+    if (error != BLE_ERROR_NONE) {
+        /* In case of error, forward the error handling to onBleInitError */
+        onBleInitError(ble, error);
+        return;
+    }
+
+    /* Ensure that it is the default instance of BLE */
+    if(ble.getInstanceID() != BLE::DEFAULT_INSTANCE) {
+        return;
+    }
+
     /* Setup advertising payload */
     ble.gap().accumulateAdvertisingPayload(GapAdvertisingData::BREDR_NOT_SUPPORTED | GapAdvertisingData::LE_GENERAL_DISCOVERABLE);
     ble.gap().accumulateAdvertisingPayload(GapAdvertisingData::GENERIC_THERMOMETER);
@@ -67,15 +91,20 @@ int main(void)
 {
     ticker.attach(periodicCallback, 2); /* trigger sensor polling every 2 seconds */
 
-    ble.init();
-    startAdvertisingTemperature();
+    BLE &ble = BLE::Instance();
+    ble.init(bleInitComplete);
+
+    /* SpinWait for initialization to complete. This is necessary because the
+     * BLE object is used in the main loop below. */
+    while (ble.hasInitialized()  == false) { /* spin loop */ }
 
     while (true) {
         if (triggerTempValueUpdate) {
-            // Do blocking calls or whatever hardware-specific action is necessary to poll the sensor.
+            /* Do blocking calls or whatever hardware-specific action is
+             * necessary to poll the sensor. */
             ApplicationData_t appData;
             setupApplicationData(appData);
-            ble.gap().updateAdvertisingPayload(GapAdvertisingData::MANUFACTURER_SPECIFIC_DATA, (uint8_t *)&appData, sizeof(ApplicationData_t));
+            ble.gap().updateAdvertisingPayload(GapAdvertisingData::MANUFACTURER_SPECIFIC_DATA, (uint8_t *) &appData, sizeof(ApplicationData_t));
 
             triggerTempValueUpdate = false;
         }
