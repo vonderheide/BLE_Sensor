@@ -3,6 +3,7 @@
  Eric Tsai
  todo:  hash mac to create unqiue identifier for "my" sensors.
 
+BLE sensor
 
  */
 
