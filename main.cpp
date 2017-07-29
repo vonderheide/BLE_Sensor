@@ -34,9 +34,7 @@ extern "C"
 InterruptIn button1(p0);
 InterruptIn button2(p1);
 
-// Rigado BMD200 ******
-//InterruptIn button1(p4);
-//InterruptIn button2(p5);
+
 
 //Serial device(p9, p11);  // tx, rx, purple board and Rigado
 #if MyDebugEnb
@@ -68,9 +66,6 @@ const static char     DEVICE_NAME[] = "CUU";
 /*
 Advertisement
 
-DECvolt:3.11111111,mag:1
-AdvData[0-2] = Look for DEC on observer
-AdvData[3] = beginning of data
 */
 //full with nullls
 static uint8_t AdvData[] = {0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0};   /* Example of hex data */
@@ -241,14 +236,7 @@ void bleInitComplete(BLE::InitializationCompleteCallbackContext *params)
     //set modes "no EDR", "discoverable" for beacon type advertisements
     ble.gap().accumulateAdvertisingPayload(GapAdvertisingData::BREDR_NOT_SUPPORTED | GapAdvertisingData::LE_GENERAL_DISCOVERABLE);
     
-    //set device profile in ADV/GATT
-    //ble.gap().accumulateAdvertisingPayload(GapAdvertisingData::GENERIC_THERMOMETER);
-    
-    //set advertising data (ADV data)
-    //ApplicationData_t appData;
-    //setupApplicationData(appData);
-    //in /BLE_API/ble/GapAdvertisingData.h:  sets payload (uuid)
-    //ble.gap().accumulateAdvertisingPayload(GapAdvertisingData::MANUFACTURER_SPECIFIC_DATA, (uint8_t *)&appData, sizeof(ApplicationData_t));
+
 
     //from GAP example
     /* Sacrifice 2B of 31B to AdvType overhead, rest goes to AdvData array you define */
@@ -264,7 +252,7 @@ void bleInitComplete(BLE::InitializationCompleteCallbackContext *params)
     //ble.gap().startAdvertising();
 }
 
-
+//not needed anymore
 //https://developer.mbed.org/users/MarceloSalazar/notebook/measuring-battery-voltage-with-nordic-nrf51x/
 void my_analogin_init(void)
 {
@@ -391,25 +379,6 @@ int main(void)
     //Timer myTimer;  //moved to global
     myTimer.start();
 
-
-    AdvData[0] = 0x44;          //D
-    AdvData[1] = 0x45;          //E
-    AdvData[2] = 0x43;          //C
-    AdvData[3] = 0x22;          //"
-    AdvData[4] = 0x76;          //V volt
-    AdvData[5] = 0x6f;          //o
-    AdvData[6] = 0x22;          //"
-    AdvData[7] = 0x3a;          //:
-    AdvData[8] = 0x24;          //3     #
-    AdvData[9] = 0x24;          //.     #
-    AdvData[10] = 0x24;         //1     #
-    AdvData[11] = 0x24;         //1     #
-    AdvData[12] = 0x2c;         //,     
-    AdvData[13] = 0x22;         //" mag
-    AdvData[14] = 0x6d;         //a
-    AdvData[15] = 0x22;         //"
-    AdvData[16] = 0x3a;         //:
-    AdvData[17] = 0x24;         //0 or 1, 30 or 31
 
     button1.fall(buttonPressedCallback);
     button1.rise(buttonReleasedCallback);
@@ -746,19 +715,6 @@ int main(void)
             ble.gap().startAdvertising();
             tic_adv.attach(stop_adv_Callback, 2); /* trigger turn off advertisement after X seconds */
 
-            /*
-            Timer myTimer;  //timed advertising
-            myTimer.start();
-            uint32_t duration = myTimer.read_ms();
-            
-            //do this as a ticker instead of keeping processor on
-            while (duration < 15000)            //advertise for 1000 ms
-            {
-                duration = myTimer.read_ms();   //read miliseconds
-            }
-            myTimer.stop();
-            ble.gap().stopAdvertising();
-            */
         
         }//end flag_update_io
         
