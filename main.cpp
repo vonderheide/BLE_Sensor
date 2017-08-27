@@ -1,14 +1,32 @@
-/* 
-Eric Tsai
+/*  
+ * Copyright (c) Eric Tsai 2017
+ *
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ *
+ * Credit: started with the basic BLE Temperature Beacon code from mbed Bluetooth Low Energy team
+ * https://developer.mbed.org/teams/Bluetooth-Low-Energy/code/BLE_TemperatureBeacon/file/0a8bbb6dea16/main.cpp
+ *
+ * BLE sensor as Beacon advertisements.  Intended to function with specific BLE observer.
+ * Tested on nRF51822 targets on mbed.
+ * keywords:  todo, tochange
+*/
 
-7/29/2017:  added clock algorithm to corresond with gateway spoof checking
- 
- */
 
-//required to call the ecb functions
 extern "C"
 {
-   #include "nrf_ecb.h"
+   #include "nrf_ecb.h"  //required to call the ecb functions for encryption
 }
  
 #include "mbed.h"
@@ -16,65 +34,97 @@ extern "C"
 #include "ble/BLE.h"
 #include "TMP_nrf51/TMP_nrf51.h"
 
-//comment out when done with debug uart, else eats batteries
-#define MyDebugEnb 0
 
-//Pin "P0.4" on nRF51822 = mbed "p4".
-//InterruptIn is pulled-up.  GND the pin to activate.
-
-// waveshare board ******
-//InterruptIn button1(p10);
-//InterruptIn button2(p11);
-
-// purple board ******
-//InterruptIn button1(p23);
-//InterruptIn button2(p24);
-
-// universal
-InterruptIn button1(p0);
-InterruptIn button2(p1);
+/*******************************************************************************************
+ * START tochange: items that may need customization depending on sensors, hardware, and desired behavior
+*******************************************************************************************/
+const uint16_t Periodic_Update_Seconds = 20; //number of seconds between periodic I/O status re-transmits 900s =15 min.
+#define MyDebugEnb 0  //enables serial output for debug, consumes ~1mA when idle
+uint8_t magnet_near=0;  //this I/O, specifically for reed switch sensor
 
 
+/* hardware interrupt pins, selected based on hardware
+ *Syntax:  Pin "P0.4" on nRF51822 documentation is mbed "p4".
+ * InterruptIn is pulled-up.  GND the pin to activate.
+*/
+InterruptIn button1(p0);    //nRF51822 P0.0
+InterruptIn button2(p1);    //nRF51822 P0.1
+/******************************************************************************************
+ * END tochange
+*******************************************************************************************/
 
-//Serial device(p9, p11);  // tx, rx, purple board and Rigado
+
 #if MyDebugEnb
-// if you see ~1mA consumption during sleep, that's because uart is enabled.
+// if you see ~1mA consumption during sleep, that's because MyDebugEnb==1, it's enabled.
 Serial device(p9, p11);  //nRF51822 uart :  TX=p9.  RX=p11
 #endif
 
+static Ticker Tic_Stop_Adv;   //used to stop advertising after X seconds
+static Ticker Tic_Debounce; //debounce I/O
+static Ticker Tic_Periodic; //transmit sensor data on a periodic basis outside I/O events
 
-static Timer myTimer;  //timed advertising
-static Ticker tic_adv;   //stop adv
-static Ticker tic_debounce; //debounce I/O
-static Ticker tic_periodic; //regular updates
-static Ticker tic_clock_reset; //resets clock
-const uint16_t Periodicity = 180;   //clock periodicity used for spoof checking, should be 1800 seconds for 30minutes
-//static TMP_nrf51  tempSensor;
-static bool flag_update_io = false;
-static bool flag_periodic_call = false;
-static bool flag_detach_adv_tic = false;
-static bool flag_set_debounce_tic = false;  //not used
+const uint16_t Periodicity = 1800;   //birthday periodicity used for spoof checking, must match gateway. Should be 1800 seconds for 30minutes
+static Timer Tmr_From_Birthday;  //holds number of seconds since birthday, for spoof detection
+static Ticker Tic_Birthday; //resets Tmr_From_Birthday every Periodicity seconds, for spoof detection
 
-//static DigitalOut alivenessLED(LED1, 1);
-float mySensor = 2.0f;
 
+static bool Flag_Update_IO = false;  //flag to indicate event is hardware interrupt
+static bool Flag_Periodic_Call = false;  //flag to indicate event is periodic callback
+static bool Flag_Detach_Adv_Tic = false;  //flag to stop advertising
 
 /* Optional: Device Name, add for human read-ability */
-const static char     DEVICE_NAME[] = "CUU";
+const static char     DEVICE_NAME[] = "LOL";
 
-/* You have up to 26 bytes of advertising data to use. */
-/*
-Advertisement
 
-*/
-//full with nullls
-static uint8_t AdvData[] = {0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0};   /* Example of hex data */
-char buffer[10]={0, 0, 0, 0, 0, 0, 0, 0, 0, 0}; //battery analog reading
-char bat_volt_char[6] = {0, 0, 0, 0, 0, 0};
-uint8_t Adv_First_Section[10];
-uint8_t mac_reverse[6] = {0x0,0x0,0x0,0x0,0x0,0x0};
-uint8_t magnet_near=0;
+//Advertisement Data
+//note:  AdvData[] holds bytes [5] to byte [30] of entire advertising data.  The user content part after ADV flag and header
+static uint8_t AdvData[] = {0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0};  //26 Bytes manufacturer specific data
+char buffer[10]={0, 0, 0, 0, 0, 0, 0, 0, 0, 0}; //hold I/O reading json
+char bat_volt_char[6] = {0, 0, 0, 0, 0, 0}; //hold json for battery reading
+uint8_t Adv_First_Section[10];  //holds the first several bytes with a pattern indicating this sensor is "one of ours" 
+uint8_t mac_reverse[6] = {0x0,0x0,0x0,0x0,0x0,0x0};  //mac address for this module
 
+/*****  Advertisement structure is 31 Bytes  ****************
+
+https://docs.mbed.com/docs/ble-intros/en/latest/Advanced/CustomGAP/
+
+Full Advertisement:
+First 5 bytes are set by stack according to flag and header parameters.
+Last 26 bytes are user data
+-- tabbed --
+Byte 0  |   AD1 Length  |       0x02    |   AD1 is 2 bytes long
+Byte 1  |   AD1 Type    |       0x01    |   AD1 Data interpreted as flag
+Byte 2  |   AD1 Data 0  |       0x06    |   AD1 Data flag mean "00000110"
+Byte 3  |   AD2 Length  |       0x1B    |   AD2 is 27 bytes (0x1B) long (rest of this data)
+Byte 4  |   AD2 Type    |       0xFF    |   0xFF mean Manufacturer Specific Data
+Byte 5  |   AD2 Data 0  |   ADV_Data[0] |   "our device" flag, MAC[3]
+Byte 6  |   AD2 Data 1  |   ADV_Data[1] |   "out device" flag, MAC[2]
+Byte 7  |   AD2 Data 2  |   ADV_Data[2] |   "out device" flag, MAC[1]
+Byte 8  |   AD2 Data 3  |   ADV_Data[3] |   "out device" flag, MAC[0]
+Byte 9  |   AD2 Data 4  |   ADV_Data[4] |   battery voltage json MSB, ie 3 in 3.14
+Byte 10 |   AD2 Data 5  |   ADV_Data[5] |   battery voltage json
+Byte 11 |   AD2 Data 6  |   ADV_Data[6] |   battery voltage json
+Byte 12 |   AD2 Data 7  |   ADV_Data[7] |   battery voltage json LSB, ie 4 in 3.14
+Byte 13 |   AD2 Data 8  |   ADV_Data[8] |   reserved
+Byte 14 |   AD2 Data 9  |   ADV_Data[9] |   reserved
+Byte 15 |   AD2 Data 10 |   ADV_Data[10] Encrypted  |   spoof - clock high byte, range 0 to 1800 seconds
+Byte 16 |   AD2 Data 11 |   ADV_Data[11] Encrypted  |   spoof - clock low byte
+Byte 17 |   AD2 Data 12 |   ADV_Data[12] Encrypted  |   Xmit_Cnt - increments per transmit event, 0-255
+Byte 18 |   AD2 Data 13 |   ADV_Data[13] Encrypted  |   JSON[0]
+Byte 19 |   AD2 Data 14 |   ADV_Data[14] Encrypted  |   JSON[1]
+Byte 20 |   AD2 Data 15 |   ADV_Data[15] Encrypted  |   JSON[2]
+Byte 21 |   AD2 Data 16 |   ADV_Data[16] Encrypted  |   JSON[3]
+Byte 22 |   AD2 Data 17 |   ADV_Data[17] Encrypted  |   JSON[4]
+Byte 23 |   AD2 Data 18 |   ADV_Data[18] Encrypted  |   JSON[5]
+Byte 24 |   AD2 Data 19 |   ADV_Data[19] Encrypted  |   JSON[6]
+Byte 25 |   AD2 Data 20 |   ADV_Data[20] Encrypted  |   JSON[7]
+Byte 26 |   AD2 Data 21 |   ADV_Data[21] Encrypted  |   JSON[8]
+Byte 27 |   AD2 Data 22 |   ADV_Data[22] Encrypted  |   JSON[9]
+Byte 28 |   AD2 Data 23 |   ADV_Data[23] Encrypted  |   JSON[10]
+Byte 29 |   AD2 Data 24 |   ADV_Data[24] Encrypted  |   JSON[11]
+Byte 30 |   AD2 Data 25 |   ADV_Data[25] Encrypted  |   JSON[12]
+
+***************************************************/
 
 
 static uint8_t key[16] = {0x1,0x2,0x3,0x4,0x1,0x2,0x3,0x4,0x1,0x2,0x3,0x4,0x1,0x2,0x3,0x4};
@@ -86,7 +136,6 @@ static uint8_t src_buf[16] = {0x1,0x2,0x3,0x4,0x1,0x2,0x3,0x4,0x1,0x2,0x3,0x4,0x
 static uint8_t des_buf[16] = {0x1,0x2,0x3,0x4,0x1,0x2,0x3,0x4,0x1,0x2,0x3,0x4,0x1,0x2,0x3,0x4};
 
 uint8_t Xmit_Cnt = 1;
-//const static uint8_t AdvData[] = {"ChangeThisData"};         /* Example of character data */
 
 
 
@@ -105,8 +154,6 @@ struct ApplicationData_t {
     //app ID is 16 bit, (0xFEFE)
     uint16_t    applicationSpecificId; /* An ID used to identify temperature value in the manufacture specific AD data field */
     
-    //float = 32-bit.  
-    //tsai: change this to uint32_t!!!
     TMP_nrf51::TempSensorValue_t tmpSensorValue;        /* this is a float (32-bit), user data */
 } PACKED;
 
@@ -114,46 +161,24 @@ struct ApplicationData_t {
 
 void debounce_Callback(void)
 {
-    tic_debounce.detach();
-    flag_set_debounce_tic = false;      //not used
-    flag_update_io = true;  //start advertising
+    Tic_Debounce.detach();
+    Flag_Update_IO = true;  //start advertising
     /* Note that the buttonPressedCallback() executes in interrupt context, so it is safer to access
      * BLE device API from the main thread. */
-    //buttonState = PRESSED;
+
 }
 
-//----- button rising ---
+//ISR for I/O interrupt
 void buttonPressedCallback(void)
 {
-
-
-    //flag_update_io = true;
-    
-    tic_debounce.attach(debounce_Callback, 1); //ok to attach multiple times, first one wins
-    
-
-    //buttonState = PRESSED;
-    
-    /*
-    if (flag_set_debounce_tic == false)
-    {
-        flag_set_debounce_tic = true;
-        
-    }
-    */
+    Tic_Debounce.attach(debounce_Callback, 1); //ok to attach multiple times, recent one wins
 }
 
-//----- button falling ---
+//ISR for I/O interrupt
 void buttonReleasedCallback(void)
 {
     
-
-    //flag_update_io = true;
-    
-    tic_debounce.attach(debounce_Callback, 1);
-    
-    
-  
+    Tic_Debounce.attach(debounce_Callback, 1);  
 }
 
 
@@ -162,33 +187,33 @@ void stop_adv_Callback(void)
     //stops advertising after X seconds
     /* Note that the Callback() executes in interrupt context, so it is safer to do
      * heavy-weight sensor polling from the main thread (where we should be able to block safely, if needed). */
-    
-    //tic_adv.detach();
-    
-    flag_detach_adv_tic = true;
-    //ble.gap().stopAdvertising();
-    
+    Flag_Detach_Adv_Tic = true;
 
 }
 
-
-
-
-
+/* ****************************************
+ * Decides what actions need to be performed on periodic basis
+*******************************************/
 void periodic_Callback(void)
 {
-    flag_update_io = true;
-    flag_periodic_call = true;
+    Flag_Update_IO = true;
+    Flag_Periodic_Call = true;
 }
 
+
+/* ****************************************
+ * No RTC available, tickers only have a 35 minute range.
+ * So periodicity for spoof avoidance is set to 30 minutes
+*******************************************/
 void clock_reset_Callback(void)
 {
 #if MyDebugEnb
     device.printf("===== reset timer =====");
     device.printf("\r\n");
 #endif
-    myTimer.reset();
+    Tmr_From_Birthday.reset();
 };
+
 
 void setupApplicationData(ApplicationData_t &appData)
 {
@@ -196,8 +221,6 @@ void setupApplicationData(ApplicationData_t &appData)
     static const uint16_t APP_SPECIFIC_ID_TEST = 0xFEFE;        //2 byte application ID
 
     appData.applicationSpecificId = APP_SPECIFIC_ID_TEST;
-    //appData.tmpSensorValue        = tempSensor.get();
-    appData.tmpSensorValue        = mySensor;
 }
 
 
@@ -209,6 +232,8 @@ void onBleInitError(BLE &ble, ble_error_t error)
 {
     /* Initialization error handling should go here */
 }
+
+
 
 /**
  * Callback triggered when the ble initialization process has finished
@@ -237,23 +262,18 @@ void bleInitComplete(BLE::InitializationCompleteCallbackContext *params)
     ble.gap().accumulateAdvertisingPayload(GapAdvertisingData::BREDR_NOT_SUPPORTED | GapAdvertisingData::LE_GENERAL_DISCOVERABLE);
     
 
-
     //from GAP example
     /* Sacrifice 2B of 31B to AdvType overhead, rest goes to AdvData array you define */
     ble.gap().accumulateAdvertisingPayload(GapAdvertisingData::MANUFACTURER_SPECIFIC_DATA, AdvData, sizeof(AdvData));
 
     /* Setup advertising parameters:  not connectable */
     ble.gap().setAdvertisingType(GapAdvertisingParams::ADV_NON_CONNECTABLE_UNDIRECTED);
-    ble.gap().setAdvertisingInterval(300);  //one advertisment every 300ms.  Self tickers, so you don't have to worry.
+    ble.gap().setAdvertisingInterval(900);  //one advertisment every 300ms.  Self tickers, so you don't have to worry.
 
-
-
-    //don't start advertising on init.  Only advertise on pin interrupt.
-    //ble.gap().startAdvertising();
 }
 
+
 //not needed anymore
-//https://developer.mbed.org/users/MarceloSalazar/notebook/measuring-battery-voltage-with-nordic-nrf51x/
 void my_analogin_init(void)
 {
     
@@ -267,7 +287,13 @@ void my_analogin_init(void)
     NRF_ADC->ENABLE = ADC_ENABLE_ENABLE_Enabled;
 }
 
-uint16_t my_analogin_read_u16(void)
+
+/* ****************************************
+ * Read battery voltage using bandgap reference
+ * shunt Vdd to ADC, thanks to Marcelo Salazar's notes here:
+ * https://developer.mbed.org/users/MarceloSalazar/notebook/measuring-battery-voltage-with-nordic-nrf51x/
+*******************************************/
+uint16_t read_bat_volt(void)
 {
     //10 bit resolution, route Vdd as analog input, set ADC ref to VBG band gap
     //disable analog pin select "PSEL" because we're using Vdd as analog input
@@ -288,7 +314,7 @@ uint16_t my_analogin_read_u16(void)
     
     //while loop doesn't actually loop until reading comlete, use a wait.
     while (((NRF_ADC->BUSY & ADC_BUSY_BUSY_Msk) >> ADC_BUSY_BUSY_Pos) == ADC_BUSY_BUSY_Busy) {};
-    wait_ms(2);
+    wait_ms(1);
 
     //save off RESULT before disabling.
     //uint16_t myresult = (uint16_t)NRF_ADC->RESULT;
@@ -299,9 +325,16 @@ uint16_t my_analogin_read_u16(void)
     
     return (uint16_t)NRF_ADC->RESULT; // 10 bit
     //return myresult;
-}
+}  //end read_bat_volt
 
-uint16_t my_analog_pin_read(void)
+
+
+/* ****************************************
+ * Read battery voltage using bandgap reference
+ * shunt analog pin to ADC, from API here
+ * https://developer.mbed.org/users/mbed_official/code/mbed-src/file/cb4253f91ada/targets/hal/TARGET_NORDIC/TARGET_NRF51822/analogin_api.c
+*******************************************/
+uint16_t read_ADC_pin(void)
 {
 
     //10 bit resolution, route PSEL pin as 1/3 input sel,
@@ -324,7 +357,7 @@ uint16_t my_analog_pin_read(void)
     
     //while loop doesn't actually loop until reading comlete, use a wait.
     while (((NRF_ADC->BUSY & ADC_BUSY_BUSY_Msk) >> ADC_BUSY_BUSY_Pos) == ADC_BUSY_BUSY_Busy) {};
-    wait_ms(2);
+    wait_ms(1);     //needed because busy while loop doesn't run.
 
     //save off RESULT before disabling.
     //uint16_t myresult = (uint16_t)NRF_ADC->RESULT;
@@ -335,10 +368,14 @@ uint16_t my_analog_pin_read(void)
     
     return (uint16_t)NRF_ADC->RESULT; // 10 bit
     //return myresult;
-}
+}  //end read_ADC_pin
 
 
-//hash_first_section(Adv_First_Section, mac_reverse, bat_reading);
+/* ****************************************
+ * Pattern scheme indicating "one of ours"
+ * generate first part of ADV data so that observer can recognize it as "one of ours".
+ * use specific schema to decide how we're recognizing our sensor ADV
+*******************************************/
 void hash_first_section(uint8_t * dest, const uint8_t * mac_addr, const char * bat_volt_str)
 {
     dest[0] = mac_addr[3];
@@ -351,46 +388,39 @@ void hash_first_section(uint8_t * dest, const uint8_t * mac_addr, const char * b
     dest[7] = bat_volt_str[3];
     dest[8] = 0x10;
     dest[9] = 0x11;
-#if MyDebugEnb
-    
-    device.printf("hash array: ");
-    for (int i=0; i<10; i++)
-    {
-        device.printf("%x ", dest[i]);
-    }
-    device.printf("\r\n");
-#endif
+    #if MyDebugEnb
+        
+        device.printf("hash array: ");
+        for (int i=0; i<10; i++)
+        {
+            device.printf("%x ", dest[i]);
+        }
+        device.printf("\r\n");
+    #endif
 }
 
 
-uint16_t clock_remainder = 0;
-
+/* ****************************************
+ * 
+ * Main Loop
+ * 
+*******************************************/
 int main(void)
 {
 
-#if MyDebugEnb
-    device.baud(9600);
-    device.printf("started sensor node 36 ");
-    device.printf("\r\n");
-#endif
+    #if MyDebugEnb
+        device.baud(9600);
+        device.printf("started sensor node 36 ");
+        device.printf("\r\n");
+    #endif
 
     
-    
-    //Timer myTimer;  //moved to global
-    myTimer.start();
+    Tmr_From_Birthday.start();      //tracks # sec since birthday
 
-
-    button1.fall(buttonPressedCallback);
-    button1.rise(buttonReleasedCallback);
-    button1.mode(PullNone);
-    button1.fall(NULL);
-    button1.rise(NULL); 
 
     BLE &ble = BLE::Instance();
     ble.init(bleInitComplete);
     
-    //debug uart
-    //device.baud(115200);
     float bat_reading;  //hold battery voltage reading (Vbg/Vcc)
     
     my_analogin_init();//routes band-gap to analog input
@@ -400,58 +430,31 @@ int main(void)
     while (ble.hasInitialized() == false) { /* spin loop */ }
     
     //every X seconds, sends period update, up to 1800 (30 minutes)
-    tic_periodic.attach(periodic_Callback, 1600);
-    tic_clock_reset.attach(clock_reset_Callback, Periodicity);
-    
-    //how to generate random number using die tempearature
-    uint32_t myTempRand;
-    uint32_t * p_temp;
-    //get temperature for random number
-    //SVCALL(SD_TEMP_GET, myTempRand, sd_temp_get(p_temp));
-    //sd_temp_get(& myTempRand);
+    Tic_Periodic.attach(periodic_Callback, Periodic_Update_Seconds);  //send updated I/O every x seconds
+    Tic_Birthday.attach(clock_reset_Callback, Periodicity);  //clock algorithm periodicity
 
 
-    ble.getAddress(0,mac_reverse);  //NOTE:  last byte of MAC (as shown on phone app) is at mac[0], not mac[6];
-#if MyDebugEnb
-    device.printf("mac = ");
-    for (int i=0; i<6; i++) //prints out MAC address in reverse order; opps.
-    {
-        device.printf("%x:", mac_reverse[i]);
-    }
-    device.printf("\r\n");
-#endif
-    while (true) {
-        //seconds counts to 35 minutes:  mySeconds=2142, then 63392 which should be 2450 but isn't.
-        //00001000,01011110   -> 11110111,10100000
-        uint16_t mySeconds =(uint16_t)(myTimer.read_ms()/1000); //problem:  mySeconds is only 2 byte
-        //xmit_cnt++;
-        //if (mySeconds > 1800)
-        //{
-        //    myTimer.reset();
-            //clock_remainder = mySeconds - 1800;
-        //}
-        //mySeconds = mySeconds + clock_remainder;  l3kjl3
-        
-        //reading the ADV value, only goes up to 0-255;
-        //reading the uart:  current time in seconds: -1782, goes negative.
-        //need to be able to count 1800 seconds since that's the length of timer.
-        
-#if MyDebugEnb
-        device.printf("current time in seconds: %d \r\n", mySeconds);
-#endif
-        //**** set which pin should be interrupt, set pullups ***
-        
+    ble.getAddress(0,mac_reverse);  //last byte of MAC (as shown on phone app) is at mac[0], not mac[6];
+    #if MyDebugEnb
+        device.printf("mac = ");
+        for (int i=0; i<6; i++) //prints out MAC address in reverse order; opps.
+        {
+            device.printf("%x:", mac_reverse[i]);
+        }
+        device.printf("\r\n");
+    #endif
+    while (true) 
+    {  //Main Loop
+
+        uint16_t seconds_Old =(uint16_t)(Tmr_From_Birthday.read_ms()/1000); // 0-1800 seconds (30 minutes)
+
+        #if MyDebugEnb
+            device.printf("current time in seconds: %d \r\n", seconds_Old);
+        #endif
+
         //set both pins to pull-up, so they're not floating when we read state
         button1.mode(PullUp);
         button2.mode(PullUp);
-        
-        //wait_ms(300);   //contact settle
-        
-
-        //AdvData[12] is automatically CR?  why?
-        
-        //0x33 0x2E 0x33 0x32 0x13
-        //   3    .    3    2   CR
         
         //expect either button1 or button2 is grounded, b/c using SPDT reed switch
         //the "common" pin on the reed switch should be on GND
@@ -460,12 +463,10 @@ int main(void)
         
         
         //let's just update the pins on every wake.  Insurance against const drain.
-        //if state == 0, pin is grounded.  Unset interrupt and float pin
-        //set the other input
+        //if state == 0, pin is grounded.  Unset interrupt and float pin, set the other pin for ISR
         if ( (button1_state == 0) && (button2_state == 1) )
         {
             magnet_near = 1;
-            //AdvData[4] = 0x11;  //dont' set ADV data directly.  Using json now, need spacing
             //button1.disable_irq() //don't know if disables IRQ on port or pin
             button1.fall(NULL);     //disable interrupt
             button1.rise(NULL);     //disable interrupt
@@ -475,14 +476,13 @@ int main(void)
             button2.fall(buttonReleasedCallback);     //enable interrupt
             button2.rise(buttonReleasedCallback);     //enable interrupt
             button2.mode(PullUp); //pull up on pin to get interrupt
-#if MyDebugEnb
-        device.printf("=== button 1!  %d seconds=== \r\n", mySeconds);
-#endif
-        }
+            #if MyDebugEnb
+            device.printf("=== button 1!  %d seconds=== \r\n", seconds_Old);
+            #endif
+        }  //end if button2
         else if ( (button1_state == 1) && (button2_state == 0) )       //assume other pin is open circuit
         {
             magnet_near = 0;
-            //AdvData[4] = 0x22;    //dont' set ADV data directly.  Using json now, need spacing
             //button1.disable_irq() //don't know if disables IRQ on port or pin
             button1.fall(buttonReleasedCallback);     //enable interrupt
             button1.rise(buttonReleasedCallback);     //enable interrupt
@@ -492,10 +492,10 @@ int main(void)
             button2.fall(NULL);     //disable interrupt
             button2.rise(NULL);     //disable interrupt
             button2.mode(PullNone); //float pin to save battery
-#if MyDebugEnb
-        device.printf("=== button 2! === %d seconds\r\n", mySeconds);
-#endif
-        }    
+            #if MyDebugEnb
+            device.printf("=== button 2! === %d seconds\r\n", seconds_Old);
+            #endif
+        }  //end if button1
         else    //odd state, shouldn't happen, suck battery and pullup both pins
         {
             magnet_near = 2;
@@ -509,158 +509,143 @@ int main(void)
             button2.fall(buttonReleasedCallback);     //disable interrupt
             button2.rise(buttonReleasedCallback);     //disable interrupt
             button2.mode(PullUp); //float pin to save battery
-#if MyDebugEnb
-        device.printf("no buttons!! %d seconds\r\n", mySeconds);
-#endif
-        }         
+            #if MyDebugEnb
+            device.printf("no buttons!! %d seconds\r\n", seconds_Old);
+            #endif
+        }  //end odd state
         
         
-        if (flag_update_io) {
+        if (Flag_Update_IO) {
             /* Do blocking calls or whatever hardware-specific action is
              * necessary to poll the sensor. */
 
+            //call attach again on periodic update to reset ticker
+            //next periodic updates happens Perioidc_Update_Seconds after I/O events
+            Tic_Periodic.attach(periodic_Callback, Periodic_Update_Seconds);   
             Xmit_Cnt++; //increment transmit counter when updating I/O
-
-
-            //read battery voltage
-            //analog reading consumes 940uA if not disabled
             
             
-            bat_reading = (float)my_analogin_read_u16();    
-            
+            //read and convert battery voltage
+            bat_reading = (float)read_bat_volt();    
             bat_reading = (bat_reading * 3.6) / 1024.0;
-#if MyDebugEnb
+            #if MyDebugEnb
             device.printf("bat reading: %f \r\n", bat_reading);
-#endif
-
-            //memset(&buffer[0], 0, sizeof(buffer));      //clear out buffer
-            //sprintf (buffer, "%f.2", bat_reading);    //don't know what i'm doing
-            //sprintf (buffer, "%.2f", bat_reading);
-            //AdvData[8] = buffer[0]; //"3"=0x33
-            //AdvData[9] = buffer[1]; //"."=0x2E
-            //AdvData[10] = buffer[2];//"3"=0x33
-            //AdvData[11] = buffer[3];//"2"=0x32
+            #endif
+            //write battery voltage
+            uint8_t total_chars;
+            memset(&bat_volt_char[0], 0, sizeof(bat_volt_char));      //clear out buffer
+            //convert battery voltage float value to string reprsentation to 2 decimal places, and save the size of string.
+            total_chars = sprintf (bat_volt_char, "%.2f", bat_reading);
             
-            //try this
-            //https://developer.mbed.org/users/mbed_official/code/mbed-src/file/cb4253f91ada/targets/hal/TARGET_NORDIC/TARGET_NRF51822/analogin_api.c
+            
+            //read and convert analog voltage.  Comment out this section if note needed, saves some battery
             NRF_ADC->TASKS_STOP = 1;
             float analogreading;
-            analogreading = (float)my_analog_pin_read();
+            analogreading = (float)read_ADC_pin();
             analogreading = (analogreading * 3.6) / 1024.0;
             #if MyDebugEnb
             device.printf("separate analog reading: %.02f \r\n", analogreading);
             #endif
             
-            //disable ADC
+            //disable ADC to save power
             NRF_ADC->TASKS_STOP = 1;
             NRF_ADC->ENABLE = ADC_ENABLE_ENABLE_Disabled;    //disable to shutdown ADC & lower bat consumption
 
 
-
-            //***********************************
-            //form JSON string in ADV_DATA
-            //1)  volts starts at AdvData[8]
-            
-
-
-            //write battery voltage
-            uint8_t total_chars;
-            memset(&bat_volt_char[0], 0, sizeof(bat_volt_char));      //clear out buffer
-            total_chars = sprintf (bat_volt_char, "%.2f", bat_reading);    //returns total number of characters
-
-#if MyDebugEnb
+            #if MyDebugEnb
             device.printf("char buff: %c%c%c%c \r\n", bat_volt_char[0], bat_volt_char[1], bat_volt_char[2], bat_volt_char[3]);
             device.printf("num chars: %d \r\n", total_chars);
-#endif
+            #endif
 
 
-
-            //memset(&Adv_First_Section[0], 0, sizeof(Adv_First_Section));  //not needed to reset
+            //Generate "First Section" for ADV_Data so gateway will recognize our advertisement pattern
             hash_first_section(Adv_First_Section, mac_reverse, bat_volt_char);
-            
 
-            
-            //------------------------------------------------------------------
-            //start writing out ADVData array
-            //------------------------------------------------------------------
 
+            /* ****************************************
+             * start writing out ADVData array
+             * todo: this is easy to write but hard to read.  Maybe make it easy to read and hard to write?
+             ******************************************/
             memset(&AdvData[0], 0, sizeof(AdvData));
             uint8_t JSON_loc=0; //AdvData[0]
 
-            AdvData[0] = Adv_First_Section[0];          //AdvData[0] = manf ID 01
-            JSON_loc++; //1
-            AdvData[1] = Adv_First_Section[1];          //AdvData[1] = manf ID 02
-            JSON_loc++; //2
-            AdvData[2] = Adv_First_Section[2];          //AdvData[2] = reserved
-            JSON_loc++; //3...
-            AdvData[3] = Adv_First_Section[3];          //AdvData[3] = reserved
+            AdvData[0] = Adv_First_Section[0];          //"our device" flag, MAC[3]
+            JSON_loc++; //JSON_loc == 1
+            AdvData[1] = Adv_First_Section[1];          //"out device" flag, MAC[2]...
+            JSON_loc++; //JSON_loc == 2
+            AdvData[2] = Adv_First_Section[2];
+            JSON_loc++; //JSON_loc == 3
+            AdvData[3] = Adv_First_Section[3];
+            JSON_loc++;  //JSON_loc == 4
+            AdvData[4] = Adv_First_Section[4];
+            JSON_loc++;  //JSON_loc == 5
+            AdvData[5] = Adv_First_Section[5];
+            JSON_loc++;  //JSON_loc == 6
+            AdvData[6] = Adv_First_Section[6];
             JSON_loc++;
-            AdvData[4] = Adv_First_Section[4];          //AdvData[4] = voltage 01
+            AdvData[7] = Adv_First_Section[7];
             JSON_loc++;
-            AdvData[5] = Adv_First_Section[5];          //AdvData[5] = voltage 02
+            AdvData[8] = Adv_First_Section[8];
             JSON_loc++;
-            AdvData[6] = Adv_First_Section[6];          //AdvData[6] = voltage 03
-            JSON_loc++;
-            AdvData[7] = Adv_First_Section[7];          //AdvData[7] = voltage 04
-            JSON_loc++;
-            AdvData[8] = Adv_First_Section[8];          //AdvData[8] = reserved
-            JSON_loc++;
-            AdvData[9] = Adv_First_Section[9];          //AdvData[9] = reserved
+            AdvData[9] = Adv_First_Section[9];
             JSON_loc++;
 
-#if MyDebugEnb
-    
-            device.printf("ADV first 10 array: ");
-            for (int i=0; i<10; i++)
-            {
-                device.printf("%x ", AdvData[i]);
-            }
-            device.printf("\r\n");
-#endif
+            #if MyDebugEnb
+                device.printf("ADV first 10 array: ");
+                for (int i=0; i<10; i++)
+                {
+                    device.printf("%x ", AdvData[i]);
+                }
+                device.printf("\r\n");
+            #endif
 
 
             JSON_loc = 10;
-            //start of encrypted data
-            //AdvData[10]
-            AdvData[10] = mySeconds & 0xFF;           //reserved for timer
+            //Start of encrypted user data
+            
+            //[10] and [11] hold 2 bytes for how many seconds since birthday, little endian
+            AdvData[10] = seconds_Old & 0xFF;
             JSON_loc++;
-            AdvData[11] = (mySeconds >> 8) & 0xFF;           //reserved for timer
+            AdvData[11] = (seconds_Old >> 8) & 0xFF;
             JSON_loc++;
+            
             AdvData[12] = Xmit_Cnt;
             JSON_loc++;
+            
             //start of jason data
+            //"mag":
             JSON_loc = 13;
-            AdvData[JSON_loc] = 0x22;       //" start mag   pos=13
+            AdvData[JSON_loc] = 0x22;       //ADV_Data[13] = "
             JSON_loc++; //14
             
-            AdvData[JSON_loc] = 0x6d;       //m,    pos=14
+            AdvData[JSON_loc] = 0x6d;       //ADV_Data[14] = m
             JSON_loc++; //15
             
-            AdvData[JSON_loc] = 0x61;       //a,    pos=15
+            AdvData[JSON_loc] = 0x61;       //ADV_Data[15] = a
             JSON_loc++; //16
             
-            AdvData[JSON_loc] = 0x67;       //g,    pos=16
+            AdvData[JSON_loc] = 0x67;       //ADV_Data[16] = g
             JSON_loc++; //17
             
-            if (flag_periodic_call)
+            //for periodic calls, we want to add an extra mqtt level "p", using "/p"
+            //to delineate between MQTT publishes from real world I/O interrupts vs timer interrupts
+            if (Flag_Periodic_Call)
             {
-                //AdvData[JSON_loc] = 0x2f;       // "/"
-                //JSON_loc++;
-                AdvData[JSON_loc] = 0x2f;       // "/"  pos=17
-                JSON_loc++;//pos=18
-                AdvData[JSON_loc] = 0x70;       // "p"  poes=18
-                JSON_loc++;//pos=19
-            }//end if period call
+                AdvData[JSON_loc] = 0x2f;       // ADV_Data[17] = /
+                JSON_loc++;  //18
+                AdvData[JSON_loc] = 0x70;       // ADV_Data[18] =p
+                JSON_loc++;  //19
+            }
             
-            AdvData[JSON_loc] = 0x22;       //"     pos = 17 or 19
+            AdvData[JSON_loc] = 0x22;       //ADV_Data[17 or 19] = "   
             JSON_loc++; //20
 
-            AdvData[JSON_loc] = 0x3a;       //:     pos = 18 or 20
-            JSON_loc++; //22
+            AdvData[JSON_loc] = 0x3a;       //ADV_Data[18 or 20] = :
+            JSON_loc++; //21
             
-            //prep magnet location (1 or 0) for char[]
+            //convert magnet variable to string, for magnet sensor, this is easy
+            //since we only have 1 or 0, but this also works for analog values
             memset(&buffer[0], 0, sizeof(buffer));      //clear out buffer
-            //magnet_near is an integer
             total_chars = sprintf (buffer, "%d", magnet_near);    //returns total number of characters, which is 1 character.
             for (int i=0; i < total_chars; i++)
             {
@@ -668,79 +653,53 @@ int main(void)
                 JSON_loc++; //23
             } //JSON_loc left at location of next character
             
-            //MUST null terminate for JSON to read correctly, else get intermittent JSON parse errors at gateway
-            //happens when string is shorter than last string, get trash left overs
-            //not really needed after clearning AdvData at start.
-            
-            
-            //AdvData[JSON_loc] = 0x0;    //null terminate here
+                        
+            //AdvData[JSON_loc] = 0x0;    //since AdvData was cleared to start with, we don't need to null term
 
             ApplicationData_t appData;
             setupApplicationData(appData);
             
-            
+            /*********************
+             * start encrypting last 16 bytes of ADV_Data
+            *********************/
             for (int i=0; i<16; i++)
             {
                 src_buf[i] = AdvData[i+10]; //start of encrypted section is at AdvData[10]
             }
-
-            //nrf_ecb_set_key(key_buf);
             nrf_ecb_init();
             nrf_ecb_set_key(key_buf);
             bool successful_ecb = nrf_ecb_crypt(des_buf, src_buf);
-#if MyDebugEnb
-            device.printf("success ecb = %d \r\n", successful_ecb);
-            device.printf("src_buf: %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x \r\n", src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], src_buf[6], src_buf[7], src_buf[8], src_buf[9], src_buf[10], src_buf[11], src_buf[12], src_buf[13], src_buf[14], src_buf[15]);
-            device.printf("des_buf: %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x \r\n", des_buf[0], des_buf[1], des_buf[2], des_buf[3], des_buf[4], des_buf[5], des_buf[6], des_buf[7], des_buf[8], des_buf[9], des_buf[10], des_buf[11], des_buf[12], des_buf[13], des_buf[14], des_buf[15]);
-#endif
-            for (int i=0; i<16; i++)
+            #if MyDebugEnb
+                device.printf("success ecb = %d \r\n", successful_ecb);
+                device.printf("src_buf: %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x \r\n", src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], src_buf[6], src_buf[7], src_buf[8], src_buf[9], src_buf[10], src_buf[11], src_buf[12], src_buf[13], src_buf[14], src_buf[15]);
+                device.printf("des_buf: %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x \r\n", des_buf[0], des_buf[1], des_buf[2], des_buf[3], des_buf[4], des_buf[5], des_buf[6], des_buf[7], des_buf[8], des_buf[9], des_buf[10], des_buf[11], des_buf[12], des_buf[13], des_buf[14], des_buf[15]);
+            #endif
+            for (int i=0; i<16; i++)  //replace last 16 bytes with encrypted 16 bytes
             {
                 AdvData[i+10] = des_buf[i];
             }
             
+            //set payload for advertisement to our custom manufactured data.  First 5 bytes is BLE standard, last 26 bytes is our array
             //ble.gap().updateAdvertisingPayload(GapAdvertisingData::MANUFACTURER_SPECIFIC_DATA, (uint8_t *) &appData, sizeof(ApplicationData_t));
             ble.gap().accumulateAdvertisingPayload(GapAdvertisingData::MANUFACTURER_SPECIFIC_DATA, AdvData, sizeof(AdvData));
             
-            flag_update_io = false;
-            flag_periodic_call = false;
+            Flag_Update_IO = false;
+            Flag_Periodic_Call = false;
             
-            //GAP::AddressType_t *myType;
-            //GAP::Address_t myAddress
-            //ble_error_t getAddress(Gap::AddressType_t *typeP, Gap::Address_t address)
-            //ble.gap().getAddress(myType, myAddress);
-            //ble.gap().getAddress(Gap::AddressType_t *typeP, Gap::Address_t address);
-
-            
-
             ble.gap().startAdvertising();
-            tic_adv.attach(stop_adv_Callback, 2); /* trigger turn off advertisement after X seconds */
-
+            Tic_Stop_Adv.attach(stop_adv_Callback, 3); /* trigger turn off advertisement after X seconds */
         
-        }//end flag_update_io
+        }//end Flag_Update_IO
         
         
-        /*
-        if (flag_set_debounce_tic == true)
-        {
-            tic_debounce.attach();
-            //flag_set_debounce_tic = false;
-            
-        }
-        */
-        
-        //if (trigger_Detach_ADV_Tick == false)
-        //{  
-        //}
-        if (flag_detach_adv_tic == true)    //Stop Advertising
+        if (Flag_Detach_Adv_Tic == true)    //ticker callback flag to stop advertising
         {
             ble.gap().stopAdvertising();    //may be safer to execute BLE operations in main
-            tic_adv.detach();
-            flag_detach_adv_tic = false;
+            Tic_Stop_Adv.detach();
+            Flag_Detach_Adv_Tic = false;
         }
-        //device.printf("Input Voltage: %f\n\r",bat_reading);
-        
-        ble.waitForEvent(); //sleeps until interrupt
-        
 
+        
+        ble.waitForEvent(); //sleeps until interrupt form ticker or I/O
     }//end forever while
 }//end main
