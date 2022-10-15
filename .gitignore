@@ -1,0 +1,12 @@
+BUILD
+?mbed
+compile_commands?json
+?clangd
+?cache
+nRF51822
+BLE_API
+mbed
+.mbed
+compile_commands.json
+.clangd
+.cache
