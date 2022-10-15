@@ -35,11 +35,11 @@
  */
 
 #include <cstdint>
+#include <vector>
 extern "C" {
 #include "nrf_ecb.h" //required to call the ecb functions for encryption
 }
 
-#include "TMP_nrf51/TMP_nrf51.h"
 #include "ble/BLE.h"
 #include "mbed.h"
 #include "toolchain.h"
@@ -50,13 +50,13 @@ extern "C" {
  *******************************************************************************************/
 
 // enables serial output for debug, consumes ~1mA when idle
-#define MyDebugEnb 0
+#define MyDebugEnb 1
 
 // number of seconds between periodic I/O status re-transmits
 const uint16_t Periodic_Update_Seconds = 20;
 
 // local advertised name
-const static char DEVICE_NAME[] = "BLE_REED";
+const static char DEVICE_NAME[] = "REED1";
 
 // hardware interrupt pins, selected based on hardware
 // Syntax:  Pin "P0.4" on nRF51822 documentation is mbed "p4".
@@ -89,39 +89,6 @@ static bool Flag_Update_IO = false;
 static bool Flag_Periodic_Call = false;
 // flag to stop advertising
 static bool Flag_Detach_Adv_Tic = false;
-
-// Advertisement Data
-// note:  AdvData[] holds bytes [5] to byte [30] of entire advertising data. The
-// user content part after ADV flag and header
-static uint8_t
-    AdvData[] =
-        {
-            0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
-            0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
-            0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0}; // 26 Bytes manufacturer
-                                                     // specific data
-char buffer[10] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};    // hold I/O reading json
-char bat_volt_char[6] = {0, 0, 0, 0, 0, 0}; // hold json for battery reading
-uint8_t Adv_First_Section[10]; // holds the first several bytes with a pattern
-                               // indicating this sensor is "one of ours"
-uint8_t mac_reverse[6] = {0x0, 0x0, 0x0,
-                          0x0, 0x0, 0x0}; // mac address for this module
-
-static uint8_t key[16] = {0x1, 0x2, 0x3, 0x4, 0x1, 0x2, 0x3, 0x4,
-                          0x1, 0x2, 0x3, 0x4, 0x1, 0x2, 0x3, 0x4};
-// 26 bytes adv data
-static uint8_t encrypted[26] = {
-    0x0, 0x0, 0x0, 0x1, 0x1, 0x1, 0x2, 0x2, 0x2, 0x3, 0x3, 0x3, 0x4, 0x4,
-    0x4, 0x5, 0x5, 0x5, 0x6, 0x6, 0x6, 0x7, 0x7, 0x7, 0x8, 0x8}; /* Example of
-                                                                    hex data */
-// static uint8_t key_buf[16] =
-// {0x1,0x2,0x3,0x4,0x1,0x2,0x3,0x4,0x1,0x2,0x3,0x4,0x1,0x2,0x3,0x4};
-static uint8_t key_buf[16] = {0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x1,
-                              0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x1, 0x2};
-static uint8_t src_buf[16] = {0x1, 0x2, 0x3, 0x4, 0x1, 0x2, 0x3, 0x4,
-                              0x1, 0x2, 0x3, 0x4, 0x1, 0x2, 0x3, 0x4};
-static uint8_t des_buf[16] = {0x1, 0x2, 0x3, 0x4, 0x1, 0x2, 0x3, 0x4,
-                              0x1, 0x2, 0x3, 0x4, 0x1, 0x2, 0x3, 0x4};
 
 void debounce_Callback(void) {
   Tic_Debounce.detach();
@@ -176,27 +143,6 @@ void bleInitComplete(BLE::InitializationCompleteCallbackContext *params) {
   if (ble.getInstanceID() != BLE::DEFAULT_INSTANCE) {
     return;
   }
-
-  /* Set device name characteristic data */
-  ble.gap().setDeviceName((const uint8_t *)DEVICE_NAME);
-
-  /* Setup advertising payload */
-  // set modes "no EDR", "discoverable" for beacon type advertisements
-  ble.gap().accumulateAdvertisingPayload(
-      GapAdvertisingData::BREDR_NOT_SUPPORTED |
-      GapAdvertisingData::LE_GENERAL_DISCOVERABLE);
-
-  // from GAP example
-  /* Sacrifice 2B of 31B to AdvType overhead, rest goes to AdvData array you
-   * define */
-  ble.gap().accumulateAdvertisingPayload(
-      GapAdvertisingData::MANUFACTURER_SPECIFIC_DATA, AdvData, sizeof(AdvData));
-
-  /* Setup advertising parameters:  not connectable */
-  ble.gap().setAdvertisingType(
-      GapAdvertisingParams::ADV_NON_CONNECTABLE_UNDIRECTED);
-  ble.gap().setAdvertisingInterval(900); // one advertisment every 300ms.  Self
-                                         // tickers, so you don't have to worry.
 }
 
 /* ****************************************
@@ -230,93 +176,90 @@ uint16_t read_bat_volt(void) {
   return (uint16_t)NRF_ADC->RESULT;
 }
 
-/* ****************************************
- * Pattern scheme indicating "one of ours"
- * generate first part of ADV data so that observer can recognize it as "one of
- *ours". use specific schema to decide how we're recognizing our sensor ADV
- *******************************************/
-void hash_first_section(uint8_t *dest, const uint8_t *mac_addr,
-                        const char *bat_volt_str) {
-  dest[0] = mac_addr[3];
-  dest[1] = mac_addr[2];
-  dest[2] = mac_addr[1];
-  dest[3] = mac_addr[0];
-  dest[4] = bat_volt_str[0];
-  dest[5] = bat_volt_str[1];
-  dest[6] = bat_volt_str[2];
-  dest[7] = bat_volt_str[3];
-  dest[8] = 0x10;
-  dest[9] = 0x11;
-#if MyDebugEnb
+uint8_t read_sensor() {
+  // set both pins to pull-up, so they're not floating when we read state
+  button1.mode(PullUp);
+  button2.mode(PullUp);
 
-  device.printf("hash array: ");
-  for (int i = 0; i < 10; i++) {
-    device.printf("%x ", dest[i]);
-  }
-  device.printf("\r\n");
+  // expect either button1 or button2 is grounded, b/c using SPDT reed switch
+  // the "common" pin on the reed switch should be on GND
+  uint8_t button1_state = button1.read();
+  uint8_t button2_state = button2.read();
+
+  // let's just update the pins on every wake.  Insurance against const drain.
+  // if state == 0, pin is grounded.  Unset interrupt and float pin, set the
+  // other pin for ISR
+  uint8_t magnet_near = 0;
+  if ((button1_state == 0) && (button2_state == 1)) {
+    magnet_near = 1;
+
+    button1.fall(NULL);     // disable interrupt
+    button1.rise(NULL);     // disable interrupt
+    button1.mode(PullNone); // float pin to save battery
+
+    button2.fall(buttonReleasedCallback); // enable interrupt
+    button2.rise(buttonReleasedCallback); // enable interrupt
+    button2.mode(PullUp);                 // pull up on pin to get interrupt
+#if MyDebugEnb
+    device.printf("=== button 1!\r\n");
 #endif
+  } else if ((button1_state == 1) && (button2_state == 0)) {
+    magnet_near = 0;
+
+    button1.fall(buttonReleasedCallback); // enable interrupt
+    button1.rise(buttonReleasedCallback); // enable interrupt
+    button1.mode(PullUp);                 // pull up on pin to get interrupt
+
+    // button2.disable_irq() //don't know if disables IRQ on port or pin
+    button2.fall(NULL);     // disable interrupt
+    button2.rise(NULL);     // disable interrupt
+    button2.mode(PullNone); // float pin to save battery
+#if MyDebugEnb
+    device.printf("=== button 2!\r\n");
+#endif
+  }    // end if button1
+  else // odd state, shouldn't happen, suck battery and pullup both pins
+  {
+    magnet_near = 2;
+
+    button1.fall(buttonReleasedCallback); // disable interrupt
+    button1.rise(buttonReleasedCallback); // disable interrupt
+    button1.mode(PullUp);                 // float pin to save battery
+
+    button2.fall(buttonReleasedCallback); // disable interrupt
+    button2.rise(buttonReleasedCallback); // disable interrupt
+    button2.mode(PullUp);                 // float pin to save battery
+#if MyDebugEnb
+    device.printf("no buttons!!\r\n");
+#endif
+  } // end odd state
+
+  return magnet_near;
 }
 
-uint8_t read_sensor() 
-{
-    // set both pins to pull-up, so they're not floating when we read state
-    button1.mode(PullUp);
-    button2.mode(PullUp);
+std::vector<uint8_t> buildBtHomePayload(bool isOpened, float batteryVoltage) {
+  std::vector<uint8_t> result;
 
-    // expect either button1 or button2 is grounded, b/c using SPDT reed switch
-    // the "common" pin on the reed switch should be on GND
-    uint8_t button1_state = button1.read();
-    uint8_t button2_state = button2.read();
+  // unencrypted
+  // TODO(jv): support encryption
+  result.push_back(0x1c);
+  result.push_back(0x18);
 
-    // let's just update the pins on every wake.  Insurance against const drain.
-    // if state == 0, pin is grounded.  Unset interrupt and float pin, set the
-    // other pin for ISR
-    uint8_t magnet_near = 0;
-    if ((button1_state == 0) && (button2_state == 1)) {
-      magnet_near = 1;
+  // sensor payload, object id "opening"
+  result.push_back(0x02);
+  result.push_back(0x11);
+  result.push_back(isOpened ? 1 : 0);
 
-      button1.fall(NULL);     // disable interrupt
-      button1.rise(NULL);     // disable interrupt
-      button1.mode(PullNone); // float pin to save battery
+  // battery voltage payload
+  uint16_t voltage = (uint16_t)(batteryVoltage * 1000);
+  device.printf("converted voltage: %d (%x, %x)\r\n", voltage, voltage & 0xff,
+                (voltage > 8) & 0xff);
+  result.push_back(0x03);
+  result.push_back(0x0c);
+  result.push_back((voltage > 8) & 0xff);
+  result.push_back(voltage & 0xff);
 
-      button2.fall(buttonReleasedCallback); // enable interrupt
-      button2.rise(buttonReleasedCallback); // enable interrupt
-      button2.mode(PullUp);                 // pull up on pin to get interrupt
-#if MyDebugEnb
-      device.printf("=== button 1!  %d seconds=== \r\n", seconds_Old);
-#endif
-    } else if ((button1_state == 1) && (button2_state == 0)) {
-      magnet_near = 0;
-
-      button1.fall(buttonReleasedCallback); // enable interrupt
-      button1.rise(buttonReleasedCallback); // enable interrupt
-      button1.mode(PullUp);                 // pull up on pin to get interrupt
-
-      // button2.disable_irq() //don't know if disables IRQ on port or pin
-      button2.fall(NULL);     // disable interrupt
-      button2.rise(NULL);     // disable interrupt
-      button2.mode(PullNone); // float pin to save battery
-#if MyDebugEnb
-      device.printf("=== button 2! === %d seconds\r\n", seconds_Old);
-#endif
-    }    // end if button1
-    else // odd state, shouldn't happen, suck battery and pullup both pins
-    {
-      magnet_near = 2;
-
-      button1.fall(buttonReleasedCallback); // disable interrupt
-      button1.rise(buttonReleasedCallback); // disable interrupt
-      button1.mode(PullUp);                 // float pin to save battery
-
-      button2.fall(buttonReleasedCallback); // disable interrupt
-      button2.rise(buttonReleasedCallback); // disable interrupt
-      button2.mode(PullUp);                 // float pin to save battery
-#if MyDebugEnb
-      device.printf("no buttons!! %d seconds\r\n", seconds_Old);
-#endif
-    } // end odd state
-
-    return magnet_near;
+  return result;
 }
 
 /* ****************************************
@@ -335,8 +278,6 @@ int main(void) {
   BLE &ble = BLE::Instance();
   ble.init(bleInitComplete);
 
-  float bat_reading; // hold battery voltage reading (Vbg/Vcc)
-
   /* SpinWait for initialization to complete. This is necessary because the
    * BLE object is used in the main loop below. */
   while (ble.hasInitialized() == false) {
@@ -346,6 +287,8 @@ int main(void) {
   Tic_Periodic.attach(
       periodic_Callback,
       Periodic_Update_Seconds); // send updated I/O every x seconds
+
+  uint8_t mac_reverse[6] = {0x0, 0x0, 0x0, 0x0, 0x0, 0x0};
 
   ble.getAddress(0, mac_reverse); // last byte of MAC (as shown on phone app) is
                                   // at mac[0], not mac[6];
@@ -357,7 +300,10 @@ int main(void) {
   }
   device.printf("\r\n");
 #endif
+
   while (true) { // Main Loop
+    device.printf("main loop\n");
+
     uint8_t magnet_near = read_sensor();
 
     if (Flag_Update_IO) {
@@ -369,162 +315,60 @@ int main(void) {
       Tic_Periodic.attach(periodic_Callback, Periodic_Update_Seconds);
 
       // read and convert battery voltage
-      bat_reading = (float)read_bat_volt();
+      float bat_reading = (float)read_bat_volt();
       bat_reading = (bat_reading * 3.6) / 1024.0;
 #if MyDebugEnb
       device.printf("bat reading: %f \r\n", bat_reading);
 #endif
-      // write battery voltage
-      uint8_t total_chars;
-      memset(&bat_volt_char[0], 0, sizeof(bat_volt_char)); // clear out buffer
-      // convert battery voltage float value to string reprsentation to 2
-      // decimal places, and save the size of string.
-      total_chars = sprintf(bat_volt_char, "%.2f", bat_reading);
 
       // disable ADC to save power
       NRF_ADC->TASKS_STOP = 1;
-      NRF_ADC->ENABLE = ADC_ENABLE_ENABLE_Disabled; // disable to shutdown ADC &
-                                                    // lower bat consumption
+      NRF_ADC->ENABLE = ADC_ENABLE_ENABLE_Disabled;
+
+      bool isOpened = magnet_near == 1;
+      std::vector<uint8_t> btHomePayload =
+          buildBtHomePayload(isOpened, bat_reading);
 
 #if MyDebugEnb
-      device.printf("char buff: %c%c%c%c \r\n", bat_volt_char[0],
-                    bat_volt_char[1], bat_volt_char[2], bat_volt_char[3]);
-      device.printf("num chars: %d \r\n", total_chars);
+      device.printf("Created payload:\r\n");
+      for (int i = 0; i < btHomePayload.size(); ++i) {
+        device.printf("%d: 0x%02x\r\n", i, btHomePayload[i]);
+      }
 #endif
 
-      // Generate "First Section" for ADV_Data so gateway will recognize our
-      // advertisement pattern
-      hash_first_section(Adv_First_Section, mac_reverse, bat_volt_char);
-
-      /* ****************************************
-       * start writing out ADVData array
-       * todo: this is easy to write but hard to read.  Maybe make it easy to
-       *read and hard to write?
-       ******************************************/
-      memset(&AdvData[0], 0, sizeof(AdvData));
-      uint8_t JSON_loc = 0; // AdvData[0]
-
-      AdvData[0] = Adv_First_Section[0]; //"our device" flag, MAC[3]
-      JSON_loc++;                        // JSON_loc == 1
-      AdvData[1] = Adv_First_Section[1]; //"out device" flag, MAC[2]...
-      JSON_loc++;                        // JSON_loc == 2
-      AdvData[2] = Adv_First_Section[2];
-      JSON_loc++; // JSON_loc == 3
-      AdvData[3] = Adv_First_Section[3];
-      JSON_loc++; // JSON_loc == 4
-      AdvData[4] = Adv_First_Section[4];
-      JSON_loc++; // JSON_loc == 5
-      AdvData[5] = Adv_First_Section[5];
-      JSON_loc++; // JSON_loc == 6
-      AdvData[6] = Adv_First_Section[6];
-      JSON_loc++;
-      AdvData[7] = Adv_First_Section[7];
-      JSON_loc++;
-      AdvData[8] = Adv_First_Section[8];
-      JSON_loc++;
-      AdvData[9] = Adv_First_Section[9];
-      JSON_loc++;
-
-#if MyDebugEnb
-      device.printf("ADV first 10 array: ");
-      for (int i = 0; i < 10; i++) {
-        device.printf("%x ", AdvData[i]);
-      }
-      device.printf("\r\n");
-#endif
-
-      JSON_loc = 10;
-      // Start of encrypted user data
-
-      AdvData[10] = 0x0;
-      JSON_loc++;
-      AdvData[11] = 0x0;
-      JSON_loc++;
-
-      AdvData[12] = 0x0;
-      JSON_loc++;
-
-      // start of jason data
-      //"mag":
-      JSON_loc = 13;
-      AdvData[JSON_loc] = 0x22; // ADV_Data[13] = "
-      JSON_loc++;               // 14
-
-      AdvData[JSON_loc] = 0x6d; // ADV_Data[14] = m
-      JSON_loc++;               // 15
-
-      AdvData[JSON_loc] = 0x61; // ADV_Data[15] = a
-      JSON_loc++;               // 16
-
-      AdvData[JSON_loc] = 0x67; // ADV_Data[16] = g
-      JSON_loc++;               // 17
-
-      // for periodic calls, we want to add an extra mqtt level "p", using "/p"
-      // to delineate between MQTT publishes from real world I/O interrupts vs
-      // timer interrupts
-      if (Flag_Periodic_Call) {
-        AdvData[JSON_loc] = 0x2f; // ADV_Data[17] = /
-        JSON_loc++;               // 18
-        AdvData[JSON_loc] = 0x70; // ADV_Data[18] =p
-        JSON_loc++;               // 19
-      }
-
-      AdvData[JSON_loc] = 0x22; // ADV_Data[17 or 19] = "
-      JSON_loc++;               // 20
-
-      AdvData[JSON_loc] = 0x3a; // ADV_Data[18 or 20] = :
-      JSON_loc++;               // 21
-
-      // convert magnet variable to string, for magnet sensor, this is easy
-      // since we only have 1 or 0, but this also works for analog values
-      memset(&buffer[0], 0, sizeof(buffer)); // clear out buffer
-      total_chars = sprintf(buffer, "%d",
-                            magnet_near); // returns total number of characters,
-                                          // which is 1 character.
-      for (int i = 0; i < total_chars; i++) {
-        AdvData[JSON_loc] = buffer[i];
-        JSON_loc++; // 23
-      }             // JSON_loc left at location of next character
-
-      // AdvData[JSON_loc] = 0x0;    //since AdvData was cleared to start with,
-      // we don't need to null term
+      ble.gap().clearAdvertisingPayload();
+      ble_error_t bleResult = ble.gap().accumulateAdvertisingPayload(
+          GapAdvertisingData::COMPLETE_LOCAL_NAME, (uint8_t *)DEVICE_NAME,
+          sizeof(DEVICE_NAME));
+      device.printf("device name result: %d\r\n", bleResult);
+      bleResult = ble.gap().accumulateAdvertisingPayload(
+          GapAdvertisingData::BREDR_NOT_SUPPORTED |
+          GapAdvertisingData::LE_GENERAL_DISCOVERABLE);
+      device.printf("pay flagd result: %d\r\n", bleResult);
+      ble.gap().setAdvertisingType(
+          GapAdvertisingParams::ADV_NON_CONNECTABLE_UNDIRECTED);
+      bleResult = ble.gap().accumulateAdvertisingPayload(
+          GapAdvertisingData::SERVICE_DATA, &btHomePayload[0],
+          btHomePayload.size());
+      device.printf("accumulate result: %d\r\n", bleResult);
+      ble.gap().setAdvertisingInterval(900);
 
       /*********************
        * start encrypting last 16 bytes of ADV_Data
        *********************/
-      for (int i = 0; i < 16; i++) {
-        src_buf[i] =
-            AdvData[i + 10]; // start of encrypted section is at AdvData[10]
-      }
-      nrf_ecb_init();
-      nrf_ecb_set_key(key_buf);
-      bool successful_ecb = nrf_ecb_crypt(des_buf, src_buf);
-#if MyDebugEnb
-      device.printf("success ecb = %d \r\n", successful_ecb);
-      device.printf(
-          "src_buf: %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x \r\n",
-          src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4],
-          src_buf[5], src_buf[6], src_buf[7], src_buf[8], src_buf[9],
-          src_buf[10], src_buf[11], src_buf[12], src_buf[13], src_buf[14],
-          src_buf[15]);
-      device.printf(
-          "des_buf: %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x \r\n",
-          des_buf[0], des_buf[1], des_buf[2], des_buf[3], des_buf[4],
-          des_buf[5], des_buf[6], des_buf[7], des_buf[8], des_buf[9],
-          des_buf[10], des_buf[11], des_buf[12], des_buf[13], des_buf[14],
-          des_buf[15]);
-#endif
-      for (int i = 0; i < 16;
-           i++) // replace last 16 bytes with encrypted 16 bytes
-      {
-        AdvData[i + 10] = des_buf[i];
-      }
-
-      // set payload for advertisement to our custom manufactured data.  First 5
-      // bytes is BLE standard, last 26 bytes is our array
-      ble.gap().accumulateAdvertisingPayload(
-          GapAdvertisingData::MANUFACTURER_SPECIFIC_DATA, AdvData,
-          sizeof(AdvData));
+      /*      for (int i = 0; i < 16; i++) {
+              src_buf[i] =
+                  AdvData[i + 10]; // start of encrypted section is at
+         AdvData[10]
+            }
+            nrf_ecb_init();
+            nrf_ecb_set_key(key_buf);
+            bool successful_ecb = nrf_ecb_crypt(des_buf, src_buf);*/
+      /*      for (int i = 0; i < 16;
+                 i++) // replace last 16 bytes with encrypted 16 bytes
+            {
+              AdvData[i + 10] = des_buf[i];
+            }*/
 
       Flag_Update_IO = false;
       Flag_Periodic_Call = false;
